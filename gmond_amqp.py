@@ -27,7 +27,7 @@ import os, sys, logging, types
 
 def gmond_poll( sources,
 		to_escalate=None, to_break=None, cycle=cycle,
-		src_escalate=[1, 1, 2.0] ):
+		src_escalate=[1, 1, 2.0], libc_gethostbyname=True ):
 	'''XML with values is fetched from possibly-multiple sources,
 			first full dump received is returned.
 		sources: iterable of sources to query - either hostname/ip or tuple of (hostname/ip, port)
@@ -41,10 +41,16 @@ def gmond_poll( sources,
 		to_break: int/float # timeout to stop waiting for data for one source (break connection)
 		cycle: int/float # used to calculate sensible values for to_*, if none is specified'''
 
+	# Otherwise gevent does it's own (although parallel)
+	#  gethostbyname, ignoring libc (ldap, nis, /etc/hosts), which is wrong
+	# Obvious downside, is that it's serial - i.e. all hosts will be resolved here and now,
+	#  before any actual xml fetching takes place, can be delayed but won't suck any less
+	libc_gethostbyname = gethostbyname if libc_gethostbyname else lambda x: x
+	sources = list(( (libc_gethostbyname(src), 8649)
+		if isinstance(src, types.StringTypes) else libc_gethostbyname(src) ) for src in sources)
+
 	# First calculate number of escalation tiers, then pick proper intervals
 	log = logging.getLogger('gmond_amqp.poller')
-	sources = list(( (gethostbyname(src), 8649)
-		if isinstance(src, types.StringTypes) else gethostbyname(src) ) for src in sources)
 	src_escalate = deque( src_escalate
 		if isinstance(src_escalate, Iterable) else [src_escalate] )
 	src_slice, src_count = src_escalate.popleft(), len(sources)
@@ -91,6 +97,11 @@ def main():
 	parser = argparse.ArgumentParser(
 		description='Collect various metrics from gmond and dispatch'
 			' them graphite-style at regular intervals to amqp (so they can be routed to carbon).')
+	parser.add_argument('--bypass-libc-gethostbyname',
+		action='store_false', default=True,
+		help='Use gevent-provided parallel gethostbyname(),'
+			' which only queries DNS servers, without /etc/nsswitch.conf, /etc/hosts'
+			' and other (g)libc stuff.')
 	parser.add_argument('--debug', action='store_true', help='Verbose operation mode.')
 	optz = parser.parse_args()
 
@@ -99,6 +110,6 @@ def main():
 		format='%(levelname)s :: %(name)s :: %(message)s' )
 
 	sources = 'raptor.v4c', 'apocrypha.v4c'
-	print(gmond_poll(sources))
+	print(gmond_poll(sources, libc_gethostbyname=optz.bypass_libc_gethostbyname))
 
 if __name__ == '__main__': main()
