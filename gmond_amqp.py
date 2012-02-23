@@ -4,7 +4,8 @@ from __future__ import print_function
 
 ####################
 
-cycle = 60 # minimal collection cycle, s
+graphite_min_cycle = 60
+gmond_default_port = 8649
 
 ####################
 
@@ -29,7 +30,7 @@ import os, sys, logging, types
 class DataPollError(Exception): pass
 
 def gmond_poll( sources,
-		timeout=cycle, to_escalate=None, to_break=None,
+		timeout=graphite_min_cycle, to_escalate=None, to_break=None,
 		src_escalate=[1, 1, 2.0], libc_gethostbyname=True,
 		log=logging.getLogger('gmond_amqp.poller') ):
 	'''XML with values is fetched from possibly-multiple sources,
@@ -52,8 +53,9 @@ def gmond_poll( sources,
 	# Obvious downside, is that it's serial - i.e. all hosts will be resolved here and now,
 	#  before any actual xml fetching takes place, can be delayed but won't suck any less
 	libc_gethostbyname = gethostbyname if libc_gethostbyname else lambda x: x
-	sources = list(( (libc_gethostbyname(src), 8649)
-		if isinstance(src, types.StringTypes) else libc_gethostbyname(src) ) for src in sources)
+	sources = list(
+		(libc_gethostbyname(src[0]), int(src[1]) if len(src)>1 else gmond_default_port)
+		for src in it.imap(op.methodcaller('rsplit', ':', 1), sources) )
 
 	# First calculate number of escalation tiers, then pick proper intervals
 	src_escalate = list(reversed( src_escalate
@@ -123,7 +125,8 @@ def main():
 		description='Collect various metrics from gmond and dispatch'
 			' them graphite-style at regular intervals to amqp (so they can be routed to carbon).')
 	parser.add_argument('sources', nargs='+',
-		help='Hostnames/ips (":port" optional, ipv4 only) of gmond nodes to poll.')
+		help=( 'Hostnames/ips (optional ":port" - defaults to {}, ipv4 only)'
+			' of gmond nodes to poll.' ).format(gmond_default_port))
 	parser.add_argument('--bypass-libc-gethostbyname',
 		action='store_false', default=True,
 		help='Use gevent-provided parallel gethostbyname(),'
