@@ -24,6 +24,9 @@ import gevent
 import itertools as it, operator as op, functools as ft
 from contextlib import closing
 from collections import Iterable
+from time import time, sleep
+from lxml import etree
+from io import BytesIO
 import os, sys, logging, types
 
 
@@ -118,6 +121,79 @@ def gmond_poll( sources,
 	finally: queries.kill(block=True)
 
 
+def gmond_xml_process( xml,
+		validate=True, validate_strict=False,
+		log=logging.getLogger('gmond_amqp.xml_parser') ):
+	'Process gmond XML data into tuples of (host_data, metrics).'
+	# Don't see much point in iterative parsing here,
+	#  since whole XML is cached into RAM anyway.
+	# Alternative is to pull it from socket through parser or cache into a file,
+	#  which may lead to parsing same XML multiple times if first link is slow.
+	# help(etree)
+	xml = etree.parse(BytesIO(xml.replace('\n', '')))
+
+	# Validation is kinda optional, but why not?
+	if validate or validate_strict:
+		dtd = xml.docinfo.internalDTD
+		if not dtd.validate(xml):
+			err = 'XML validation failed, errors:\n{}'.format(
+					'\n'.join(it.imap(bytes, dtd.error_log.filter_from_errors())) )
+			if validate_strict: raise AssertionError(err)
+			else: log.warn(err)
+
+	for host in root.iter('HOST'):
+		yield (host.attrib, map(op.attrgetter('attrib'), host.iter('METRIC')))
+
+
+class DataMangler(object):
+	log = logging.getLogger('gmond_amqp.data_mangler')
+
+	def __init__(self):
+		self._counter_cache = dict()
+		self._counter_cache_check_ts = 0
+		self._counter_cache_check_timeout = 12 * 3600
+		self._counter_cache_check_count = 4
+
+	def _counter_cache_cleanup(self, ts, to):
+		cleanup_list = list( k for k,(v,ts_chk) in
+			self._counter_cache.viewitems() if (ts - to) > ts_chk )
+		self.log.debug('Counter cache cleanup: {} buckets'.format(len(cleanup_list)))
+		for k in cleanup_list: del self._counter_cache[k]
+
+	def derive(self, name, mtype, value, ts=None):
+		ts = ts or time()
+		if ts > self._counter_cache_check_ts:
+			self._counter_cache_cleanup( ts,
+				self._counter_cache_check_timeout )
+			self._counter_cache_check_ts = ts\
+				+ self._counter_cache_check_timeout\
+				/ self._counter_cache_check_count
+		if mtype == 'counter':
+			if name not in self._counter_cache:
+				self.log.debug('Initializing bucket for new counter: {}'.format(name))
+				self._counter_cache[name] = value, ts
+				return None
+			v0, ts0 = self._counter_cache[name]
+			value = float(value - v0) / (ts - ts0)
+			self._counter_cache[name] = value, ts
+			if value < 0:
+				# TODO: handle overflows properly, w/ limits
+				self.log.debug( 'Detected counter overflow'
+					' (negative delta): {}, {} -> {}'.format(name, v0, value) )
+				return None
+		elif mtype == 'gauge': value = value
+		else: raise TypeError('Unknown type: {}'.format(mtype))
+		return name, value, ts
+
+	def process(self, host, metric, ts=None):
+		# 1. Produce metric name from host and metric data
+		# 2. Produce derivative metric value, return along with raw one
+		raise NotImplementedError
+
+	def process_host(self, host, metrics, ts=None):
+		for metric in metrics: yield self.process(host, metric, ts=None)
+
+
 
 def main():
 	import argparse
@@ -127,6 +203,7 @@ def main():
 	parser.add_argument('sources', nargs='+',
 		help=( 'Hostnames/ips (optional ":port" - defaults to {}, ipv4 only)'
 			' of gmond nodes to poll.' ).format(gmond_default_port))
+	parser.add_argument('-n', '--dry-run', action='store_true', help='Do not actually send data.')
 	parser.add_argument('--bypass-libc-gethostbyname',
 		action='store_false', default=True,
 		help='Use gevent-provided parallel gethostbyname(),'
@@ -139,6 +216,26 @@ def main():
 		level=logging.WARNING if not optz.debug else logging.DEBUG,
 		format='%(levelname)s :: %(name)s :: %(message)s' )
 
-	print(gmond_poll(optz.sources, libc_gethostbyname=optz.bypass_libc_gethostbyname))
+	log=logging.getLogger('gmond_amqp.main_loop')
+	mangler = DataMangler()
+
+	ts = time()
+	while True:
+		ts_now = time()
+		# data = list((name, timestamp, val, val_raw), ...)
+		data = list(it.starmap(
+			ft.partial(mangler.process_host, ts=ts_now),
+			gmond_xml_process(gmond_poll( optz.sources,
+				libc_gethostbyname=optz.bypass_libc_gethostbyname )) ))
+
+		log.debug('Publishing {} datapoints'.format(len(data)))
+		if not optz.dry_run:
+			raise NotImplementedError
+			amqp.publish(data)
+
+		while ts < ts_now: ts += optz.interval
+		ts_sleep = max(0, ts - time())
+		log.debug('Sleep: {}s'.format(ts_sleep))
+		sleep(ts_sleep)
 
 if __name__ == '__main__': main()
