@@ -22,6 +22,7 @@ from gevent import greenlet, socket, Timeout, GreenletExit
 import gevent
 
 import itertools as it, operator as op, functools as ft
+from pprint import pprint
 from contextlib import closing
 from collections import Iterable
 from time import time, sleep
@@ -141,9 +142,10 @@ def gmond_xml_process( xml,
 			if validate_strict: raise AssertionError(err)
 			else: log.warn(err)
 
-	for cluster in root.iter('CLUSTER'):
-		yield cluster, list(( host.attrib,
-			map(op.attrgetter('attrib'), host.iter('METRIC')) ) for host in root.iter('HOST'))
+	for cluster in xml.iter('CLUSTER'):
+		yield cluster.attrib, list(
+			(host.attrib, map(op.attrgetter('attrib'), host.iter('METRIC')))
+			for host in cluster.iter('HOST') )
 
 
 class DataMangler(object):
@@ -153,22 +155,22 @@ class DataMangler(object):
 	class IgnoreValue(Exception): pass
 
 	def __init__(self):
-		self._cache = dict()
+		self._cache_dict = dict()
 		self._cache_check_timeout = 12 * 3600
 		self._cache_check_count = 4
 
 	def _cache(self, cache_id, val_id, val=None, ts=None):
 		ts_now = ts or time()
-		if cache_id not in self._cache: # init new cache type
-			self._cache[cache_id] = dict(), ts_now
-		cache, ts = self._cache[cache_id]
+		if cache_id not in self._cache_dict: # init new cache type
+			self._cache_dict[cache_id] = dict(), ts_now
+		cache, ts = self._cache_dict[cache_id]
 		if ts_now > ts: # cleanup
 			cleanup_list = list( k for k, (v, ts_chk) in
 				cache.viewitems() if (ts_now - self._cache_check_timeout) > ts_chk )
 			self.log.debug(( 'Cache {!r} cleanup:'
 				' {} buckets' ).format(cache_id, len(cleanup_list)))
 			for k in cleanup_list: del cache[k]
-			self._cache[cache_id] = cache, ts_now\
+			self._cache_dict[cache_id] = cache, ts_now\
 				+ self._cache_check_timeout / self._cache_check_count
 		if val is None: return cache[val_id][0]
 		else:
@@ -207,7 +209,7 @@ class DataMangler(object):
 			_vtypes=dict(
 				int=re.compile('^int\d+$'),
 				uint=re.compile('^uint\d+|timestamp$'),
-				float={'float', 'double'} ):
+				float={'float', 'double'} ) ):
 		val, vtype, vslope = op.itemgetter('VAL', 'TYPE', 'SLOPE')(metric)
 		if vtype == 'string': val = bytes(val)
 		elif _vtypes['int'].search(vtype): val = int(val)
@@ -216,12 +218,12 @@ class DataMangler(object):
 			assert val > 0
 		elif vtype in _vtypes['float']: val = float(val)
 		if vtype == 'timestamp': mtype = 'timestamp'
-		elif slope == 'positive': mtype = 'counter'
-		elif slope in {'negative', 'both'}: mtype = 'derive'
-		elif slope == 'zero': mtype = 'gauge'
+		elif vslope == 'positive': mtype = 'counter'
+		elif vslope in 'negative': mtype = 'derive'
+		elif vslope in {'zero', 'both'}: mtype = 'gauge'
 		else:
 			raise TypeError( 'Unable to handle'
-				' slope/value type: {}/{}'.format(slope, vtype) )
+				' value slope/type: {}/{}'.format(vslope, vtype) )
 		return val, mtype
 
 	def process_metric(self, name, host, metric, ts=None):
@@ -284,35 +286,45 @@ def main():
 	parser = argparse.ArgumentParser(
 		description='Collect various metrics from gmond and dispatch'
 			' them graphite-style at regular intervals to amqp (so they can be routed to carbon).')
+
 	parser.add_argument('sources', nargs='+',
 		help=( 'Hostnames/ips (optional ":port" - defaults to {}, ipv4 only)'
 			' of gmond nodes to poll.' ).format(gmond_default_port))
+
 	parser.add_argument('-n', '--dry-run', action='store_true', help='Do not actually send data.')
+	# TODO: interval should be configurable on per-value basis
+	parser.add_argument('-i', '--interval', type=int, default=graphite_min_cycle,
+		help='Interval between polling/sending datapoints (default: %(default)ss).')
+
 	parser.add_argument('--bypass-libc-gethostbyname',
 		action='store_false', default=True,
 		help='Use gevent-provided parallel gethostbyname(),'
 			' which only queries DNS servers, without /etc/nsswitch.conf, /etc/hosts'
 			' and other (g)libc stuff.')
+	parser.add_argument('--dump', action='store_true', help='Dump polled data to stdout.')
 	parser.add_argument('--debug', action='store_true', help='Verbose operation mode.')
+
 	optz = parser.parse_args()
 
+	global graphite_min_cycle
+	graphite_min_cycle = optz.interval
 	logging.basicConfig(
 		level=logging.WARNING if not optz.debug else logging.DEBUG,
 		format='%(levelname)s :: %(name)s :: %(message)s' )
 
-	log=logging.getLogger('gmond_amqp.main_loop')
+	log = logging.getLogger('gmond_amqp.main_loop')
 	mangler = DataMangler()
 
 	ts = time()
 	while True:
 		ts_now = time()
-		# data = list((name, timestamp, val, val_raw), ...)
-		data = list(it.starmap(
-			ft.partial(mangler.process_host, ts=ts_now),
+		data = list(it.chain.from_iterable(it.starmap(
+			ft.partial(mangler.process_cluster, ts=ts_now),
 			gmond_xml_process(gmond_poll( optz.sources,
-				libc_gethostbyname=optz.bypass_libc_gethostbyname )) ))
+				libc_gethostbyname=optz.bypass_libc_gethostbyname )) )))
 
 		log.debug('Publishing {} datapoints'.format(len(data)))
+		if optz.dump: pprint(data)
 		if not optz.dry_run:
 			raise NotImplementedError
 			amqp.publish(data)
