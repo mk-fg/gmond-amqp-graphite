@@ -27,7 +27,7 @@ from collections import Iterable
 from time import time, sleep
 from lxml import etree
 from io import BytesIO
-import os, sys, logging, types
+import os, sys, logging, types, re
 
 
 class DataPollError(Exception): pass
@@ -141,57 +141,141 @@ def gmond_xml_process( xml,
 			if validate_strict: raise AssertionError(err)
 			else: log.warn(err)
 
-	for host in root.iter('HOST'):
-		yield (host.attrib, map(op.attrgetter('attrib'), host.iter('METRIC')))
+	for cluster in root.iter('CLUSTER'):
+		yield cluster, list(( host.attrib,
+			map(op.attrgetter('attrib'), host.iter('METRIC')) ) for host in root.iter('HOST'))
 
 
 class DataMangler(object):
+
 	log = logging.getLogger('gmond_amqp.data_mangler')
 
-	def __init__(self):
-		self._counter_cache = dict()
-		self._counter_cache_check_ts = 0
-		self._counter_cache_check_timeout = 12 * 3600
-		self._counter_cache_check_count = 4
+	class IgnoreValue(Exception): pass
 
-	def _counter_cache_cleanup(self, ts, to):
-		cleanup_list = list( k for k,(v,ts_chk) in
-			self._counter_cache.viewitems() if (ts - to) > ts_chk )
-		self.log.debug('Counter cache cleanup: {} buckets'.format(len(cleanup_list)))
-		for k in cleanup_list: del self._counter_cache[k]
+	def __init__(self):
+		self._cache = dict()
+		self._cache_check_timeout = 12 * 3600
+		self._cache_check_count = 4
+
+	def _cache(self, cache_id, val_id, val=None, ts=None):
+		ts_now = ts or time()
+		if cache_id not in self._cache: # init new cache type
+			self._cache[cache_id] = dict(), ts_now
+		cache, ts = self._cache[cache_id]
+		if ts_now > ts: # cleanup
+			cleanup_list = list( k for k, (v, ts_chk) in
+				cache.viewitems() if (ts_now - self._cache_check_timeout) > ts_chk )
+			self.log.debug(( 'Cache {!r} cleanup:'
+				' {} buckets' ).format(cache_id, len(cleanup_list)))
+			for k in cleanup_list: del cache[k]
+			self._cache[cache_id] = cache, ts_now\
+				+ self._cache_check_timeout / self._cache_check_count
+		if val is None: return cache[val_id][0]
+		else:
+			cache[val_id] = val, ts_now
+			return val
 
 	def derive(self, name, mtype, value, ts=None):
-		ts = ts or time()
-		if ts > self._counter_cache_check_ts:
-			self._counter_cache_cleanup( ts,
-				self._counter_cache_check_timeout )
-			self._counter_cache_check_ts = ts\
-				+ self._counter_cache_check_timeout\
-				/ self._counter_cache_check_count
+		ts_now = time()
+		cache = ft.partial(self._cache, 'counters', ts=ts_now)
+		ts = ts or ts_now
 		if mtype == 'counter':
-			if name not in self._counter_cache:
+			try: v0, ts0, _ = cache(name)
+			except KeyError:
 				self.log.debug('Initializing bucket for new counter: {}'.format(name))
-				self._counter_cache[name] = value, ts
-				return None
-			v0, ts0 = self._counter_cache[name]
+				cache(name, (value, ts))
+				raise self.IgnoreValue(name)
 			value = float(value - v0) / (ts - ts0)
-			self._counter_cache[name] = value, ts
+			cache(name, (value, ts))
 			if value < 0:
-				# TODO: handle overflows properly, w/ limits
 				self.log.debug( 'Detected counter overflow'
 					' (negative delta): {}, {} -> {}'.format(name, v0, value) )
-				return None
+				raise self.IgnoreValue(name)
 		elif mtype == 'gauge': value = value
+		elif mtype == 'timestamp':
+			try: ts = cache(name)
+			except KeyError: ts = None
+			if ts == value:
+				log.debug( 'Ignoring duplicate'
+					' timestamp value for {}: {}'.format(name, value) )
+				raise self.IgnoreValue(name)
+			value, ts = 1, cache(name, value)
 		else: raise TypeError('Unknown type: {}'.format(mtype))
-		return name, value, ts
+		return value, ts
 
-	def process(self, host, metric, ts=None):
-		# 1. Produce metric name from host and metric data
-		# 2. Produce derivative metric value, return along with raw one
-		raise NotImplementedError
+	def process_value( self, metric,
+			_vtypes=dict(
+				int=re.compile('^int\d+$'),
+				uint=re.compile('^uint\d+|timestamp$'),
+				float={'float', 'double'} ):
+		val, vtype, vslope = op.itemgetter('VAL', 'TYPE', 'SLOPE')(metric)
+		if vtype == 'string': val = bytes(val)
+		elif _vtypes['int'].search(vtype): val = int(val)
+		elif _vtypes['uint'].search(vtype):
+			val = int(val)
+			assert val > 0
+		elif vtype in _vtypes['float']: val = float(val)
+		if vtype == 'timestamp': mtype = 'timestamp'
+		elif slope == 'positive': mtype = 'counter'
+		elif slope in {'negative', 'both'}: mtype = 'derive'
+		elif slope == 'zero': mtype = 'gauge'
+		else:
+			raise TypeError( 'Unable to handle'
+				' slope/value type: {}/{}'.format(slope, vtype) )
+		return val, mtype
 
-	def process_host(self, host, metrics, ts=None):
-		for metric in metrics: yield self.process(host, metric, ts=None)
+	def process_metric(self, name, host, metric, ts=None):
+		ts = ts or time()
+		val_raw, mtype = self.process_value(metric)
+		val, ts = self.derive(name, mtype, val_raw, ts)
+		return ts, val, val_raw
+
+	def process_name( self,
+			cluster_name, host_name, metric_name,
+			template='{host_short}.{metric}', ts=None ):
+		cache_key = cluster_name, host_name
+		cache = ft.partial(self._cache, 'names', ts=ts or time())
+		try: parts = cache(cache_key)
+		except KeyError:
+			parts = dict(
+				it.chain.from_iterable(
+					( ('{}_first_{}'.format(label, i), '.'.join(first)),
+						('{}_first_{}_rev'.format(label, i), '.'.join(reversed(first))),
+						('{}_last_{}'.format(label, i), '.'.join(last)),
+						('{}_last_{}_rev'.format(label, i), '.'.join(reversed(last))) )
+					for i, label, first, last in (
+						(i, label, name.split('.')[:-i], name.split('.')[i:])
+						for i, (label, name) in it.product( xrange(5),
+							[('cluster', cluster_name), ('host', host_name)] ) ) ))
+			for label in ['cluster', 'host']:
+				parts['{}_short'.format(label)] = parts['{}_first_1'.format(label)]
+			cache(cache_key, parts)
+		return template.format(**dict(it.chain(
+			parts.viewitems(), [('metric', metric_name)] )))
+
+	def process_cluster( self, cluster, hosts,
+			ts_stale_limit=graphite_min_cycle, ts=None ):
+		ts_now = ts or time()
+		if abs(int(cluster['LOCALTIME']) - ts_now) > ts_stale_limit:
+			log.warn(( 'Localtime for cluster {0[NAME]} ({0}) is way off'
+				' the local timestamp (limit: {1})' ).format(cluster, ts_stale_limit))
+		for host, metrics in hosts:
+			tn, ts_host = it.imap(int, op.itemgetter('TN', 'REPORTED')(host))
+			ts_host += tn
+			if tn > ts_stale_limit:
+				log.error(( 'Data for host {0[NAME]} ({0}) is too'
+					' stale (limit: {1}), skipping metrics for host' ).format(host, ts_stale_limit))
+			elif abs(ts_now - ts_host) > ts_stale_limit:
+				log.error(( '"Reported" timestamp for host {0[NAME]}'
+					' ({0}) is way off the local timestamp (limit: {1}),'
+					' skipping metrics for host' ).format(host, ts_stale_limit))
+			else:
+				process_name = ft.partial( self.process_name,
+					*it.imap(op.itemgetter('NAME'), [cluster, host]) )
+				for metric in metrics:
+					name = process_name(metric['NAME'])
+					try: yield (name,) + self.process_metric(name, host, metric, ts=ts_host)
+					except self.IgnoreValue: pass
 
 
 
