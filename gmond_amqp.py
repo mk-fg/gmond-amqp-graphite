@@ -286,7 +286,7 @@ class DataMangler(object):
 					' skipping metrics for host' ).format(host, ts_stale_limit))
 			else:
 				process_name = ft.partial( self.process_name,
-					*it.imap(op.itemgetter('NAME'), [cluster, host]) )
+					*it.imap(op.itemgetter('NAME'), [cluster, host]), ts=ts )
 				for metric in metrics:
 					name = process_name(metric['NAME'])
 					try: yield (name,) + self.process_metric(name, host, metric, ts=ts_host)
@@ -361,7 +361,6 @@ class AMQPLink(object):
 						routing_key=metric, body='{} {} {}'.format(metric, ts, val),
 						properties=BasicProperties(content_type='application/carbon', delivery_mode=2) )
 				self.ch.tx_commit()
-				sleep(1)
 			except (self.PikaError, socket.error) as err:
 				(self.log.error if not log_tracebacks else self.log.exception)\
 					('Severed connection to AMQP broker: {}'.format(err))
