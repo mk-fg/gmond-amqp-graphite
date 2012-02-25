@@ -5,11 +5,11 @@ from __future__ import print_function
 ####################
 
 graphite_min_cycle = 60
-gmond_default_port = 8649
+log_tracebacks = True
 
 ####################
 
-from socket import gethostbyname # gevent works around libc
+from socket import gethostbyname, gethostname # gevent works around libc
 from gevent import monkey
 monkey.patch_all()
 
@@ -21,12 +21,26 @@ from gevent.coros import Semaphore
 from gevent import greenlet, socket, Timeout, GreenletExit
 import gevent
 
+from lxml import etree
+
+from pika.adapters import BlockingConnection
+from pika.credentials import PlainCredentials
+from pika import BasicProperties, ConnectionParameters
+import pika.log
+
+try:
+	import pika.adapters.blocking_connection
+	pika.adapters.blocking_connection.log
+except ImportError: pass
+except AttributeError:
+	# Fixup for 0.9.5 bug - "log" global is undeclared there
+	pika.adapters.blocking_connection.log = pika.log
+
 import itertools as it, operator as op, functools as ft
 from pprint import pprint
 from contextlib import closing
 from collections import Iterable
 from time import time, sleep
-from lxml import etree
 from io import BytesIO
 import os, sys, logging, types, re
 
@@ -35,8 +49,7 @@ class DataPollError(Exception): pass
 
 def gmond_poll( sources,
 		timeout=graphite_min_cycle, to_escalate=None, to_break=None,
-		src_escalate=[1, 1, 2.0], libc_gethostbyname=True,
-		log=logging.getLogger('gmond_amqp.poller') ):
+		src_escalate=[1, 1, 2.0], default_port=8649, libc_gethostbyname=True ):
 	'''XML with values is fetched from possibly-multiple sources,
 			first full dump received is returned.
 		sources: iterable of sources to query - either hostname/ip or tuple of (hostname/ip, port)
@@ -51,6 +64,7 @@ def gmond_poll( sources,
 		timeout: int/float # global timeout
 			(not counting libc.gethostbyname for all sources, if used),
 			also used to calculate sensible values for to_*, if none specified'''
+	log = logging.getLogger('gmond_amqp.poller')
 
 	# Otherwise gevent does it's own (although parallel)
 	#  gethostbyname, ignoring libc (ldap, nis, /etc/hosts), which is wrong
@@ -58,7 +72,7 @@ def gmond_poll( sources,
 	#  before any actual xml fetching takes place, can be delayed but won't suck any less
 	libc_gethostbyname = gethostbyname if libc_gethostbyname else lambda x: x
 	sources = list(
-		(libc_gethostbyname(src[0]), int(src[1]) if len(src)>1 else gmond_default_port)
+		(libc_gethostbyname(src[0]), int(src[1]) if len(src)>1 else default_port)
 		for src in it.imap(op.methodcaller('rsplit', ':', 1), sources) )
 
 	# First calculate number of escalation tiers, then pick proper intervals
@@ -130,7 +144,6 @@ def gmond_xml_process( xml,
 	#  since whole XML is cached into RAM anyway.
 	# Alternative is to pull it from socket through parser or cache into a file,
 	#  which may lead to parsing same XML multiple times if first link is slow.
-	# help(etree)
 	xml = etree.parse(BytesIO(xml.replace('\n', '')))
 
 	# Validation is kinda optional, but why not?
@@ -150,11 +163,12 @@ def gmond_xml_process( xml,
 
 class DataMangler(object):
 
-	log = logging.getLogger('gmond_amqp.data_mangler')
-
 	class IgnoreValue(Exception): pass
 
-	def __init__(self):
+	def __init__(self, name_template):
+		self.log = logging.getLogger('gmond_amqp.data_mangler')
+		self.name_template = name_template
+
 		self._cache_dict = dict()
 		self._cache_check_timeout = 12 * 3600
 		self._cache_check_count = 4
@@ -233,8 +247,7 @@ class DataMangler(object):
 		return ts, val, val_raw
 
 	def process_name( self,
-			cluster_name, host_name, metric_name,
-			template='{host_short}.{metric}', ts=None ):
+			cluster_name, host_name, metric_name, ts=None ):
 		cache_key = cluster_name, host_name
 		cache = ft.partial(self._cache, 'names', ts=ts or time())
 		try: parts = cache(cache_key)
@@ -252,7 +265,7 @@ class DataMangler(object):
 			for label in ['cluster', 'host']:
 				parts['{}_short'.format(label)] = parts['{}_first_1'.format(label)]
 			cache(cache_key, parts)
-		return template.format(**dict(it.chain(
+		return self.name_template.format(**dict(it.chain(
 			parts.viewitems(), [('metric', metric_name)] )))
 
 	def process_cluster( self, cluster, hosts,
@@ -280,56 +293,150 @@ class DataMangler(object):
 					except self.IgnoreValue: pass
 
 
+class AMQPLink(object):
+
+	class PikaError(Exception): pass
+
+	link = None
+
+	def __init__( self, host, auth, exchange,
+			heartbeat=True, reconnect_delays=5, libc_gethostbyname=True ):
+		self.log = logging.getLogger('gmond_amqp.amqp_link')
+		self.host, self.auth, self.exchange, self.heartbeat,\
+			self.libc_gethostbyname = host, auth, exchange, heartbeat, libc_gethostbyname
+		if isinstance(reconnect_delays, (int, float)): reconnect_delays = [reconnect_delays]
+		self.reconnect_delays, self.reconnect_info = reconnect_delays, None
+		self.connect() # mainly to notify if it fails at start
+
+	def _error_callback(self, msg, *argz, **kwz):
+		raise kwz.pop('err', self.PikaError)(msg)
+
+	def connect(self):
+		host = self.host
+		if self.libc_gethostbyname: host = gethostbyname(self.host)
+		while True:
+			if self.link and self.link.is_open:
+				try: self.link.close()
+				except: pass
+
+			try:
+				self.log.debug('Connecting to AMQP broker ({})'.format(host))
+				self.link = BlockingConnection(ConnectionParameters( host,
+					heartbeat=self.heartbeat, credentials=PlainCredentials(*self.auth) ))
+
+				# Even with BlockingConnection adapter,
+				#  pika doesn't raise errors, unless you set callbacks to do that
+				self.link.set_backpressure_multiplier(2)
+				self.link.add_backpressure_callback(
+					ft.partial(self._error_callback, 'timeout') )
+				self.link.add_on_close_callback(
+					ft.partial(self._error_callback, 'closed/error') )
+
+				self.ch = self.link.channel()
+				exchange = self.exchange.copy()
+				self.ch.exchange_declare(exchange=exchange.pop('name'), **exchange)
+				self.ch.tx_select()
+
+			except (self.PikaError, socket.error) as err:
+				(self.log.error if not log_tracebacks else self.log.exception)\
+					('Connection to AMQP broker has failed: {}'.format(err))
+				delay = self.reconnect_info and self.reconnect_info[0] # first delay is 0
+				if delay:
+					self.log.debug('Will retry connection in {}s'.format(delay))
+					sleep(delay)
+				self.reconnect_info = self.reconnect_info or self.reconnect_delays
+				if len(self.reconnect_info) > 1: self.reconnect_info = self.reconnect_info[1:]
+
+			else:
+				self.reconnect_info = None
+				break
+
+	def publish(self, data):
+		while True:
+			try:
+				if not self.link: raise self.PikaError
+				for metric, ts, val, val_raw in data:
+					self.ch.basic_publish(
+						exchange=self.exchange.name,
+						routing_key=metric, body='{} {} {}'.format(metric, ts, val),
+						properties=BasicProperties(content_type='application/carbon', delivery_mode=2) )
+				self.ch.tx_commit()
+				sleep(1)
+			except (self.PikaError, socket.error) as err:
+				(self.log.error if not log_tracebacks else self.log.exception)\
+					('Severed connection to AMQP broker: {}'.format(err))
+				self.connect()
+			else: break
+
 
 def main():
+	global graphite_min_cycle, log_tracebacks # can be updated
+
 	import argparse
 	parser = argparse.ArgumentParser(
 		description='Collect various metrics from gmond and dispatch'
 			' them graphite-style at regular intervals to amqp (so they can be routed to carbon).')
-
-	parser.add_argument('sources', nargs='+',
-		help=( 'Hostnames/ips (optional ":port" - defaults to {}, ipv4 only)'
-			' of gmond nodes to poll.' ).format(gmond_default_port))
-
+	parser.add_argument('-c', '--config', action='append', default=list(),
+		help='Additional configuration files to read. Can be specified'
+			' multiple times, values from later ones override values in the former.')
 	parser.add_argument('-n', '--dry-run', action='store_true', help='Do not actually send data.')
-	# TODO: interval should be configurable on per-value basis
-	parser.add_argument('-i', '--interval', type=int, default=graphite_min_cycle,
-		help='Interval between polling/sending datapoints (default: %(default)ss).')
-
-	parser.add_argument('--bypass-libc-gethostbyname',
-		action='store_false', default=True,
-		help='Use gevent-provided parallel gethostbyname(),'
-			' which only queries DNS servers, without /etc/nsswitch.conf, /etc/hosts'
-			' and other (g)libc stuff.')
 	parser.add_argument('--dump', action='store_true', help='Dump polled data to stdout.')
 	parser.add_argument('--debug', action='store_true', help='Verbose operation mode.')
-
 	optz = parser.parse_args()
 
-	global graphite_min_cycle
-	graphite_min_cycle = optz.interval
-	logging.basicConfig(
-		level=logging.WARNING if not optz.debug else logging.DEBUG,
-		format='%(levelname)s :: %(name)s :: %(message)s' )
+	from utils import AttrDict, configure_logging
+
+	cfg = AttrDict.from_yaml('{}.yaml'.format(
+		os.path.splitext(os.path.realpath(__file__))[0] ), if_exists=True)
+	for k in optz.config: cfg.update_yaml(k)
+	configure_logging( cfg.logging,
+		logging.DEBUG if optz.debug else logging.WARNING )
+	logging.captureWarnings(cfg.logging.warnings)
+
+	optz.dump = optz.dump or cfg.debug.dump_data
+	optz.dry_run = optz.dry_run or cfg.debug.dry_run
+	graphite_min_cycle, log_tracebacks = cfg.metrics.interval, cfg.logging.tracebacks
 
 	log = logging.getLogger('gmond_amqp.main_loop')
-	mangler = DataMangler()
+	mangler = DataMangler(name_template=cfg.metrics.name)
+	amqp = AMQPLink( host=cfg.net.amqp.host,
+		auth=(cfg.net.amqp.user, cfg.net.amqp.password),
+		exchange=cfg.net.amqp.exchange, heartbeat=cfg.net.amqp.heartbeat,
+		libc_gethostbyname=not cfg.net.bypass_libc_gethostbyname )
 
-	ts = time()
+	ts, data = time(), list()
+	self_profiling = cfg.metrics.self_profiling and '{}.gmond_amqp'.format(
+		socket.gethostname() if cfg.net.bypass_libc_gethostbyname else gethostname() )
 	while True:
 		ts_now = time()
-		data = list(it.chain.from_iterable(it.starmap(
-			ft.partial(mangler.process_cluster, ts=ts_now),
-			gmond_xml_process(gmond_poll( optz.sources,
-				libc_gethostbyname=optz.bypass_libc_gethostbyname )) )))
 
+		xml = gmond_poll( cfg.net.gmond.hosts,
+			libc_gethostbyname=not cfg.net.bypass_libc_gethostbyname,
+			default_port=cfg.net.gmond.default_port )
+		if self_profiling:
+			ts_new, ts_prof = time(), ts_now
+			val, ts_prof = ts_new - ts_prof, ts_new
+			data.append(('{}.poll'.format(self_profiling), ts_now, val, val))
+
+		xml = gmond_xml_process( xml,
+			validate=cfg.net.gmond.validate_xml,
+			validate_strict=cfg.net.gmond.validate_strict )
+		if self_profiling:
+			ts_new = time()
+			val, ts_prof = ts_new - ts_prof, ts_new
+			data.append(('{}.process'.format(self_profiling), ts_now, val, val))
+
+		data.extend(it.chain.from_iterable(it.starmap(
+			ft.partial(mangler.process_cluster, ts=ts_now), xml )))
 		log.debug('Publishing {} datapoints'.format(len(data)))
 		if optz.dump: pprint(data)
-		if not optz.dry_run:
-			raise NotImplementedError
-			amqp.publish(data)
+		if not optz.dry_run: amqp.publish(data)
+		if self_profiling:
+			ts_new = time()
+			val, ts_prof = ts_new - ts_prof, ts_new
+			data = [('{}.publish'.format(self_profiling), ts_now, val, val)]
 
-		while ts < ts_now: ts += optz.interval
+		while ts <= ts_now: ts += cfg.metrics.interval
 		ts_sleep = max(0, ts - time())
 		log.debug('Sleep: {}s'.format(ts_sleep))
 		sleep(ts_sleep)

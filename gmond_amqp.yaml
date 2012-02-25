@@ -1,0 +1,53 @@
+metrics:
+  interval: 60
+  name: '{host_short}.{metric}' # {host,cluster}{,_short,_{first,last}_{1,2,...}{,_rev}}, metric
+  self_profiling: true
+
+net:
+  amqp:
+    host: localhost
+    user:
+    password:
+    exchange:
+      name: metrics.carbon
+      type: topic
+      durable: true
+    heartbeat: true
+    reconnect_delays: [1, 2, 2, 10] # int/float or list of these, last one is used for all subsequent attempts
+  gmond:
+    hosts:
+    default_port: 8649
+    validate_xml: true
+    validate_strict: false
+  bypass_libc_gethostbyname: false
+
+debug:
+  dry_run: false
+  dump_data: false
+
+logging:
+  warnings: true # pika issues python warnings sometimes
+  tracebacks: true # much easier to debug with these, but noisy and multiline
+  version: 1
+  formatters:
+    basic:
+      format: '%(asctime)s :: %(levelname)s :: %(name)s: %(message)s'
+      datefmt: '%Y-%m-%d %H:%M:%S'
+  handlers:
+    console:
+      class: logging.StreamHandler
+      stream: ext://sys.stdout
+      formatter: basic
+      level: custom
+    # file:
+    #   class: logging.handlers.WatchedFileHandler
+    #   filename: /var/log/gmond_amqp.log
+    #   formatter: basic
+    #   encoding: utf-8
+    #   level: DEBUG
+  # loggers:
+  #   pika:
+  #     level: custom
+  root:
+    handlers: [console]
+    level: custom
