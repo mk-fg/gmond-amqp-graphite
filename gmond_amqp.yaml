@@ -1,7 +1,14 @@
 metrics:
   interval: 60
-  name: '{host_short}.{metric}' # {host,cluster}{,_short,_{first,last}_{1,2,...}{,_rev}}, metric
   self_profiling: true
+  name:
+    full: '{host_short}.{metric}' # {host,cluster}{,_short,_{first,last}_{1,2,...}{,_rev}}, metric
+    rewrite: # args to re.sub()
+      # '^cpu_(.*)$': 'cpu.all.\1'
+    aliases: # applied both before and after rewrite rules
+      # cpu_intr: cpu_interrupt
+      # cpu_sintr: cpu_softirq
+      # cpu_wio: cpu_wait
 
 net:
   amqp:

@@ -165,9 +165,13 @@ class DataMangler(object):
 
 	class IgnoreValue(Exception): pass
 
-	def __init__(self, name_template):
+	def __init__( self, name_template,
+			name_rewrite=dict(), name_aliases=dict() ):
 		self.log = logging.getLogger('gmond_amqp.data_mangler')
-		self.name_template = name_template
+		self.name_template, self.name_aliases\
+			= name_template, name_aliases or dict()
+		self.name_rewrite = list( (re.compile(src), dst)
+			for src, dst in (name_rewrite or dict()).viewitems() )
 
 		self._cache_dict = dict()
 		self._cache_check_timeout = 12 * 3600
@@ -248,8 +252,9 @@ class DataMangler(object):
 
 	def process_name( self,
 			cluster_name, host_name, metric_name, ts=None ):
-		cache_key = cluster_name, host_name
 		cache = ft.partial(self._cache, 'names', ts=ts or time())
+		# Get/build list of template parameters
+		cache_key = cluster_name, host_name
 		try: parts = cache(cache_key)
 		except KeyError:
 			parts = dict(
@@ -265,6 +270,15 @@ class DataMangler(object):
 			for label in ['cluster', 'host']:
 				parts['{}_short'.format(label)] = parts['{}_first_1'.format(label)]
 			cache(cache_key, parts)
+		# Apply rewrites/aliases to a metric name
+		try: metric_name = cache(metric_name)
+		except KeyError:
+			cache_key = metric_name
+			metric_name = self.name_aliases.get(metric_name, metric_name)
+			for src, dst in self.name_rewrite:
+				metric_name = re.sub(src, dst, metric_name)
+			metric_name = self.name_aliases.get(metric_name, metric_name)
+			cache(cache_key, metric_name)
 		return self.name_template.format(**dict(it.chain(
 			parts.viewitems(), [('metric', metric_name)] )))
 
@@ -398,7 +412,10 @@ def main():
 	graphite_min_cycle, log_tracebacks = cfg.metrics.interval, cfg.logging.tracebacks
 
 	log = logging.getLogger('gmond_amqp.main_loop')
-	mangler = DataMangler(name_template=cfg.metrics.name)
+	mangler = DataMangler(
+		name_template=cfg.metrics.name.full,
+		name_rewrite=cfg.metrics.name.rewrite,
+		name_aliases=cfg.metrics.name.aliases )
 	amqp = AMQPLink( host=cfg.net.amqp.host,
 		auth=(cfg.net.amqp.user, cfg.net.amqp.password),
 		exchange=cfg.net.amqp.exchange, heartbeat=cfg.net.amqp.heartbeat,
