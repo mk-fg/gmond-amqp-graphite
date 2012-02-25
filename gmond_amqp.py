@@ -300,8 +300,9 @@ class AMQPLink(object):
 	link = None
 
 	def __init__( self, host, auth, exchange,
-			heartbeat=True, reconnect_delays=5, libc_gethostbyname=True ):
+			heartbeat=False, reconnect_delays=5, libc_gethostbyname=True ):
 		self.log = logging.getLogger('gmond_amqp.amqp_link')
+		if heartbeat: raise NotImplementedError
 		self.host, self.auth, self.exchange, self.heartbeat,\
 			self.libc_gethostbyname = host, auth, exchange, heartbeat, libc_gethostbyname
 		if isinstance(reconnect_delays, (int, float)): reconnect_delays = [reconnect_delays]

@@ -12,7 +12,7 @@ net:
       name: metrics.carbon
       type: topic
       durable: true
-    heartbeat: true
+    heartbeat: false
     reconnect_delays: [1, 2, 2, 10] # int/float or list of these, last one is used for all subsequent attempts
   gmond:
     hosts:
