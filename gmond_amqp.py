@@ -36,11 +36,14 @@ except AttributeError:
 	# Fixup for 0.9.5 bug - "log" global is undeclared there
 	pika.adapters.blocking_connection.log = pika.log
 
+from utils import AttrDict, configure_logging, AMQPLink
+
 import itertools as it, operator as op, functools as ft
 from pprint import pprint
 from contextlib import closing
 from collections import Iterable
 from time import time, sleep
+from json import dumps
 from io import BytesIO
 import os, sys, logging, types, re
 
@@ -73,7 +76,8 @@ def gmond_poll( sources,
 	libc_gethostbyname = gethostbyname if libc_gethostbyname else lambda x: x
 	sources = list(
 		(libc_gethostbyname(src[0]), int(src[1]) if len(src)>1 else default_port)
-		for src in it.imap(op.methodcaller('rsplit', ':', 1), sources) )
+		for src in ((src.rsplit(':', 1) if isinstance( src,
+			types.StringTypes ) else src) for src in sources) )
 
 	# First calculate number of escalation tiers, then pick proper intervals
 	src_escalate = list(reversed( src_escalate
@@ -307,74 +311,26 @@ class DataMangler(object):
 					except self.IgnoreValue: pass
 
 
-class AMQPLink(object):
+class AMQPPublisher(AMQPLink):
 
-	class PikaError(Exception): pass
-
-	link = None
-
-	def __init__( self, host, auth, exchange,
-			heartbeat=False, reconnect_delays=5, libc_gethostbyname=True ):
-		self.log = logging.getLogger('gmond_amqp.amqp_link')
-		if heartbeat: raise NotImplementedError
-		self.host, self.auth, self.exchange, self.heartbeat,\
-			self.libc_gethostbyname = host, auth, exchange, heartbeat, libc_gethostbyname
-		if isinstance(reconnect_delays, (int, float)): reconnect_delays = [reconnect_delays]
-		self.reconnect_delays, self.reconnect_info = reconnect_delays, None
-		self.connect() # mainly to notify if it fails at start
-
-	def _error_callback(self, msg, *argz, **kwz):
-		raise kwz.pop('err', self.PikaError)(msg)
-
-	def connect(self):
-		host = self.host
-		if self.libc_gethostbyname: host = gethostbyname(self.host)
-		while True:
-			if self.link and self.link.is_open:
-				try: self.link.close()
-				except: pass
-
-			try:
-				self.log.debug('Connecting to AMQP broker ({})'.format(host))
-				self.link = BlockingConnection(ConnectionParameters( host,
-					heartbeat=self.heartbeat, credentials=PlainCredentials(*self.auth) ))
-
-				# Even with BlockingConnection adapter,
-				#  pika doesn't raise errors, unless you set callbacks to do that
-				self.link.set_backpressure_multiplier(2)
-				self.link.add_backpressure_callback(
-					ft.partial(self._error_callback, 'timeout') )
-				self.link.add_on_close_callback(
-					ft.partial(self._error_callback, 'closed/error') )
-
-				self.ch = self.link.channel()
-				exchange = self.exchange.copy()
-				self.ch.exchange_declare(exchange=exchange.pop('name'), **exchange)
-				self.ch.tx_select()
-
-			except (self.PikaError, socket.error) as err:
-				(self.log.error if not log_tracebacks else self.log.exception)\
-					('Connection to AMQP broker has failed: {}'.format(err))
-				delay = self.reconnect_info and self.reconnect_info[0] # first delay is 0
-				if delay:
-					self.log.debug('Will retry connection in {}s'.format(delay))
-					sleep(delay)
-				self.reconnect_info = self.reconnect_info or self.reconnect_delays
-				if len(self.reconnect_info) > 1: self.reconnect_info = self.reconnect_info[1:]
-
-			else:
-				self.reconnect_info = None
-				break
+	def encode(self, data, content_type='application/x-gmond-amqp-1'):
+		if content_type == 'application/x-gmond-amqp-1':
+			metric, ts, val, val_raw = data
+			assert isinstance(metric, bytes) and isinstance(ts, int)
+			data = json.dumps(data)
+		else: raise NotImplementedError('Unknown content type: {}'.format(content_type))
+		return data, content_type
 
 	def publish(self, data):
 		while True:
 			try:
 				if not self.link: raise self.PikaError
-				for metric, ts, val, val_raw in data:
+				for body in data:
+					metric, ts, val, val_raw = body
+					body, content_type = self.encode(body)
 					self.ch.basic_publish(
-						exchange=self.exchange.name,
-						routing_key=metric, body='{} {} {}'.format(metric, ts, val),
-						properties=BasicProperties(content_type='application/carbon', delivery_mode=2) )
+						exchange=self.exchange.name, routing_key=metric, body=body,
+						properties=BasicProperties(content_type=content_type, delivery_mode=2) )
 				self.ch.tx_commit()
 			except (self.PikaError, socket.error) as err:
 				(self.log.error if not log_tracebacks else self.log.exception)\
@@ -398,8 +354,6 @@ def main():
 	parser.add_argument('--debug', action='store_true', help='Verbose operation mode.')
 	optz = parser.parse_args()
 
-	from utils import AttrDict, configure_logging
-
 	cfg = AttrDict.from_yaml('{}.yaml'.format(
 		os.path.splitext(os.path.realpath(__file__))[0] ), if_exists=True)
 	for k in optz.config: cfg.update_yaml(k)
@@ -416,10 +370,11 @@ def main():
 		name_template=cfg.metrics.name.full,
 		name_rewrite=cfg.metrics.name.rewrite,
 		name_aliases=cfg.metrics.name.aliases )
-	amqp = AMQPLink( host=cfg.net.amqp.host,
+	amqp = AMQPPublisher( host=cfg.net.amqp.host,
 		auth=(cfg.net.amqp.user, cfg.net.amqp.password),
 		exchange=cfg.net.amqp.exchange, heartbeat=cfg.net.amqp.heartbeat,
-		libc_gethostbyname=not cfg.net.bypass_libc_gethostbyname )
+		libc_gethostbyname=not cfg.net.bypass_libc_gethostbyname,
+		log=logging.getLogger('gmond_amqp.amqp_link') )
 
 	ts, data = time(), list()
 	self_profiling = cfg.metrics.self_profiling and '{}.gmond_amqp'.format(

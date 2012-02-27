@@ -1,6 +1,11 @@
 import itertools as it, operator as op, functools as ft
 from collections import Mapping
 
+from pika.adapters import BlockingConnection
+from pika.credentials import PlainCredentials
+from pika import BasicProperties, ConnectionParameters
+import pika.log
+
 
 class AttrDict(dict):
 	def __init__(self, *argz, **kwz):
@@ -53,3 +58,75 @@ def configure_logging(cfg, custom_level=None):
 		if isinstance(entity, Mapping)\
 			and entity.get('level') == 'custom': entity['level'] = custom_level
 	logging.config.dictConfig(cfg)
+
+
+def node_id():
+	return '--'.join(
+		it.imap(op.itemgetter(0), it.groupby(it.imap(
+			lambda val: open(val).read().strip(),
+			it.ifilter(os.path.exists, [ '/etc/machine-id',
+				'/var/lib/dbus/machine-id', '/proc/sys/kernel/random/boot_id' ]) ))) )
+
+
+class AMQPLink(object):
+
+	class PikaError(Exception): pass
+
+	link = None
+
+	def __init__( self, host, auth, exchange,
+			heartbeat=False, reconnect_delays=5,
+			libc_gethostbyname=True, log=None ):
+		self.log = log or logging.getLogger('amqp')
+		if heartbeat: raise NotImplementedError
+		self.host, self.auth, self.exchange, self.heartbeat,\
+			self.libc_gethostbyname = host, auth, exchange, heartbeat, libc_gethostbyname
+		if isinstance(reconnect_delays, (int, float)): reconnect_delays = [reconnect_delays]
+		self.reconnect_delays, self.reconnect_info = reconnect_delays, None
+		self.connect() # mainly to notify if it fails at start
+
+	def schema_init(self):
+		exchange = self.exchange.copy()
+		self.ch.exchange_declare(exchange=exchange.pop('name'), **exchange)
+
+	def _error_callback(self, msg, *argz, **kwz):
+		raise kwz.pop('err', self.PikaError)(msg)
+
+	def connect(self):
+		host = self.host
+		if self.libc_gethostbyname: host = gethostbyname(self.host)
+		while True:
+			if self.link and self.link.is_open:
+				try: self.link.close()
+				except: pass
+
+			try:
+				self.log.debug('Connecting to AMQP broker ({})'.format(host))
+				self.link = BlockingConnection(ConnectionParameters( host,
+					heartbeat=self.heartbeat, credentials=PlainCredentials(*self.auth) ))
+
+				# Even with BlockingConnection adapter,
+				#  pika doesn't raise errors, unless you set callbacks to do that
+				self.link.set_backpressure_multiplier(2)
+				self.link.add_backpressure_callback(
+					ft.partial(self._error_callback, 'timeout') )
+				self.link.add_on_close_callback(
+					ft.partial(self._error_callback, 'closed/error') )
+
+				self.ch = self.link.channel()
+				self.schema_init()
+				self.ch.tx_select() # forces flush
+
+			except (self.PikaError, socket.error) as err:
+				(self.log.error if not log_tracebacks else self.log.exception)\
+					('Connection to AMQP broker has failed: {}'.format(err))
+				delay = self.reconnect_info and self.reconnect_info[0] # first delay is 0
+				if delay:
+					self.log.debug('Will retry connection in {}s'.format(delay))
+					sleep(delay)
+				self.reconnect_info = self.reconnect_info or self.reconnect_delays
+				if len(self.reconnect_info) > 1: self.reconnect_info = self.reconnect_info[1:]
+
+			else:
+				self.reconnect_info = None
+				break
