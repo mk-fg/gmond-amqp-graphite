@@ -5,7 +5,6 @@ from __future__ import print_function
 ####################
 
 graphite_min_cycle = 60
-log_tracebacks = True
 
 ####################
 
@@ -52,7 +51,7 @@ class DataPollError(Exception): pass
 
 def gmond_poll( sources,
 		timeout=graphite_min_cycle, to_escalate=None, to_break=None,
-		src_escalate=[1, 1, 2.0], default_port=8649, libc_gethostbyname=True ):
+		src_escalate=[1, 1, 2.0], default_port=8649, libc_gethostbyname=gethostname ):
 	'''XML with values is fetched from possibly-multiple sources,
 			first full dump received is returned.
 		sources: iterable of sources to query - either hostname/ip or tuple of (hostname/ip, port)
@@ -73,7 +72,7 @@ def gmond_poll( sources,
 	#  gethostbyname, ignoring libc (ldap, nis, /etc/hosts), which is wrong
 	# Obvious downside, is that it's serial - i.e. all hosts will be resolved here and now,
 	#  before any actual xml fetching takes place, can be delayed but won't suck any less
-	libc_gethostbyname = gethostbyname if libc_gethostbyname else lambda x: x
+	if not libc_gethostbyname: libc_gethostbyname = lambda x: x
 	sources = list(
 		(libc_gethostbyname(src[0]), int(src[1]) if len(src)>1 else default_port)
 		for src in ((src.rsplit(':', 1) if isinstance( src,
@@ -170,8 +169,10 @@ class DataMangler(object):
 	class IgnoreValue(Exception): pass
 
 	def __init__( self, name_template,
-			name_rewrite=dict(), name_aliases=dict() ):
+			name_rewrite=dict(), name_aliases=dict(),
+			log_tracebacks=True ):
 		self.log = logging.getLogger('gmond_amqp.data_mangler')
+		if not log_tracebacks: self.log.exception = self.log.error
 		self.name_template, self.name_aliases\
 			= name_template, name_aliases or dict()
 		self.name_rewrite = list( (re.compile(src), dst)
@@ -316,8 +317,8 @@ class AMQPPublisher(AMQPLink):
 	def encode(self, data, content_type='application/x-gmond-amqp-1'):
 		if content_type == 'application/x-gmond-amqp-1':
 			metric, ts, val, val_raw = data
-			assert isinstance(metric, bytes) and isinstance(ts, int)
-			data = json.dumps(data)
+			assert isinstance(metric, bytes) and isinstance(ts, (int, float))
+			data = dumps(data)
 		else: raise NotImplementedError('Unknown content type: {}'.format(content_type))
 		return data, content_type
 
@@ -333,14 +334,13 @@ class AMQPPublisher(AMQPLink):
 						properties=BasicProperties(content_type=content_type, delivery_mode=2) )
 				self.ch.tx_commit()
 			except (self.PikaError, socket.error) as err:
-				(self.log.error if not log_tracebacks else self.log.exception)\
-					('Severed connection to AMQP broker: {}'.format(err))
+				self.log.exception('Severed connection to AMQP broker: {}'.format(err))
 				self.connect()
 			else: break
 
 
 def main():
-	global graphite_min_cycle, log_tracebacks # can be updated
+	global graphite_min_cycle # can be updated
 
 	import argparse
 	parser = argparse.ArgumentParser(
@@ -363,18 +363,22 @@ def main():
 
 	optz.dump = optz.dump or cfg.debug.dump_data
 	optz.dry_run = optz.dry_run or cfg.debug.dry_run
-	graphite_min_cycle, log_tracebacks = cfg.metrics.interval, cfg.logging.tracebacks
+	graphite_min_cycle = cfg.metrics.interval
 
-	log = logging.getLogger('gmond_amqp.main_loop')
 	mangler = DataMangler(
 		name_template=cfg.metrics.name.full,
 		name_rewrite=cfg.metrics.name.rewrite,
 		name_aliases=cfg.metrics.name.aliases )
+
+	log = logging.getLogger('gmond_amqp.amqp_link')
+	if not cfg.logging.tracebacks: log.exception = log.error
 	amqp = AMQPPublisher( host=cfg.net.amqp.host,
 		auth=(cfg.net.amqp.user, cfg.net.amqp.password),
 		exchange=cfg.net.amqp.exchange, heartbeat=cfg.net.amqp.heartbeat,
-		libc_gethostbyname=not cfg.net.bypass_libc_gethostbyname,
-		log=logging.getLogger('gmond_amqp.amqp_link') )
+		log=log, libc_gethostbyname=gethostbyname\
+			if not cfg.net.bypass_libc_gethostbyname else False )
+
+	log = logging.getLogger('gmond_amqp.main_loop')
 
 	ts, data = time(), list()
 	self_profiling = cfg.metrics.self_profiling and '{}.gmond_amqp'.format(
@@ -383,7 +387,8 @@ def main():
 		ts_now = time()
 
 		xml = gmond_poll( cfg.net.gmond.hosts,
-			libc_gethostbyname=not cfg.net.bypass_libc_gethostbyname,
+			libc_gethostbyname=gethostbyname\
+				if not cfg.net.bypass_libc_gethostbyname else False,
 			default_port=cfg.net.gmond.default_port )
 		if self_profiling:
 			ts_new, ts_prof = time(), ts_now

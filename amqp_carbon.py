@@ -2,18 +2,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import print_function
 
-####################
-
-carbon_default_port = 2003
-
-####################
-
 from utils import AttrDict, configure_logging, AMQPLink, node_id
 
 import itertools as it, operator as op, functools as ft
 from time import time, sleep
 from json import loads
-import os, sys, logging
+import os, sys, logging, types, socket
 
 
 class CarbonClient(object):
@@ -67,22 +61,26 @@ class CarbonClient(object):
 
 class AMQPHarvester(AMQPLink):
 
+	tx = False
+	ack_count = 0
+
 	def __init__(self, *argz, **kwz):
-		self.carbon = kwz.pop('destination')
+		self.callback = kwz.pop('callback')
+		self.queue = kwz.pop('queue')
 		self.dry_run = kwz.pop('dry_run', False) # still consumes stuff from queue
 		self.dump = kwz.pop('dump', False)
-		self.exclusive = kwz.pop('exclusive', False) # force 1 consumer per node per queue
-
-		if not self.dry_run: self.carbon_link = CarbonClient(self.carbon)
-		self.queue = 'harvester.{}'.format(':'.join(self.carbon))
+		self.exclusive = kwz.pop('exclusive', 'per-host') # force 1 consumer per node per queue
+		self.ack_batch = kwz.pop('ack_batch', False)
 		super(AMQPHarvester, self).__init__(*argz, **kwz)
 
 	def schema_init(self):
 		super(AMQPHarvester, self).schema_init()
-		# TODO: http://www.rabbitmq.com/extensions.html#queue-ttl
-		self.ch.queue_declare(queue=self.queue, durable=True)
-		self.ch.queue_bind( queue=self.queue,
-			exchange=self.exchange.name, routing_key='%' )
+		queue = self.queue.copy()
+		queue_name = queue.pop('name')
+		self.ch.queue_declare(queue=queue_name, **queue)
+		# TODO: configurable bindings
+		self.ch.queue_bind( queue=queue_name,
+			exchange=self.exchange.name, routing_key='#' )
 
 	def decode(self, buff, content_type):
 		if content_type == 'application/x-gmond-amqp-1': return loads(buff)
@@ -90,18 +88,22 @@ class AMQPHarvester(AMQPLink):
 
 	def process(self, ch, method, head, body):
 		metric, ts, val, val_raw = self.decode(body, content_type=head.content_type)
-		if not self.dry_run: self.carbon_link.send(metric, val, ts)
-		if self.dump: print('{} {} {}'.format(metric, val, ts))
-		ch.basic_ack(method.delivery_tag) # should pass exceptions to loop-starter
+		self.callback(metric, ts, val, val_raw)
+		if self.ack_batch:
+			self.ack_count += 1
+			if self.ack_count < self.ack_batch: return
+			else: self.ack_count = 0
+		ch.basic_ack(method.delivery_tag, multiple=bool(self.ack_batch))
 
 	def harvest(self):
-		consumer_kwz = dict() if not self.exclusive\
-			else dict(consumer_tag=self.queue + node_id())
+		consumer_kwz = dict(exclusive=bool(self.exclusive))\
+			if self.exclusive != 'per-host' else dict(consumer_tag=self.queue.name + node_id())
 		while True:
 			try:
 				if not self.link: raise self.PikaError
 				tag = self.ch.basic_consume(
-					self.process, queue=self.queue, **consumer_kwz )
+					self.process, queue=self.queue.name, **consumer_kwz )
+				self.log.debug('Starting queue consumer loop')
 				try: self.ch.start_consuming() # infinite loop
 				finally:
 					try: self.ch.basic_cancel(consumer_tag=tag)
@@ -144,17 +146,24 @@ def main():
 		dst = dst.rsplit(':', 1)
 		dst = dst[0], int(dst[1]) if len(dst) > 1 else cfg.net.carbon.default_port
 
+	dump = (lambda metric, val, ts: print('{} {} {}'.format(metric, val, ts)))\
+		if optz.dump else lambda metric, val, ts: None
+	if not optz.dry_run:
+		carbon = CarbonClient(dst)
+		dst = lambda metric, ts, val, val_raw: (
+			dump(metric, val, ts), carbon.send(metric, val, ts) )
+	else: dst = lambda metric, ts, val, val_raw: dump(metric, val, ts)
+
 	amqp = AMQPHarvester(
 		host=cfg.net.amqp.host,
 		auth=(cfg.net.amqp.user, cfg.net.amqp.password),
-		exchange=cfg.net.amqp.exchange, heartbeat=cfg.net.amqp.heartbeat,
-		libc_gethostbyname=not cfg.net.bypass_libc_gethostbyname,
+		exchange=cfg.net.amqp.exchange, queue=cfg.net.amqp.queue,
+		heartbeat=cfg.net.amqp.heartbeat,
 		log=logging.getLogger('amqp_carbon.amqp_link'),
-		destination=dst, dry_run=optz.dry_run, dump=optz.dump )
+		callback=dst,
+		exclusive=cfg.net.amqp.consume.exclusive,
+		ack_batch=cfg.net.amqp.consume.ack_batch )
 
-	log = logging.getLogger('amqp_carbon.main_loop')
+	amqp.harvest()
 
-	log.debug('Waiting for requests')
-	try: ch.start_consuming() # infinite loop
-	except KeyboardInterrupt: pass
-	finally: ch.basic_cancel(consumer_tag=mq_local_id)
+if __name__ == '__main__': main()

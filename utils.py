@@ -1,10 +1,12 @@
-import itertools as it, operator as op, functools as ft
-from collections import Mapping
-
 from pika.adapters import BlockingConnection
 from pika.credentials import PlainCredentials
 from pika import BasicProperties, ConnectionParameters
 import pika.log
+
+import itertools as it, operator as op, functools as ft
+from collections import Mapping
+from time import time, sleep
+import os, sys, socket
 
 
 class AttrDict(dict):
@@ -73,10 +75,11 @@ class AMQPLink(object):
 	class PikaError(Exception): pass
 
 	link = None
+	tx = True
 
 	def __init__( self, host, auth, exchange,
 			heartbeat=False, reconnect_delays=5,
-			libc_gethostbyname=True, log=None ):
+			libc_gethostbyname=None, log=None ):
 		self.log = log or logging.getLogger('amqp')
 		if heartbeat: raise NotImplementedError
 		self.host, self.auth, self.exchange, self.heartbeat,\
@@ -94,7 +97,7 @@ class AMQPLink(object):
 
 	def connect(self):
 		host = self.host
-		if self.libc_gethostbyname: host = gethostbyname(self.host)
+		if self.libc_gethostbyname: host = self.libc_gethostbyname(self.host)
 		while True:
 			if self.link and self.link.is_open:
 				try: self.link.close()
@@ -115,11 +118,10 @@ class AMQPLink(object):
 
 				self.ch = self.link.channel()
 				self.schema_init()
-				self.ch.tx_select() # forces flush
+				if self.tx: self.ch.tx_select() # forces flush
 
 			except (self.PikaError, socket.error) as err:
-				(self.log.error if not log_tracebacks else self.log.exception)\
-					('Connection to AMQP broker has failed: {}'.format(err))
+				self.log.exception('Connection to AMQP broker has failed: {}'.format(err))
 				delay = self.reconnect_info and self.reconnect_info[0] # first delay is 0
 				if delay:
 					self.log.debug('Will retry connection in {}s'.format(delay))
