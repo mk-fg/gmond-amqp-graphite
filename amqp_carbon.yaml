@@ -11,9 +11,11 @@ net:
       # http://www.rabbitmq.com/extensions.html#queue-ttl
       name: queue.harvester.localhost:2003
       durable: true
+      delete_first: false # true/false/if-empty, can be used to update queue bindings
+      bind: '#' # routing-key parameter(s) (can be a list) to use with queue_bind
     consume:
       exclusive: per-host # options: per-host/true/false, per-host meaning "use host-unique consumer_tag"
-      ack_batch: 100 # send one ack with multiple=True per-batch, False/None/1 - disable
+      ack_batch: 100 # send one ack with multiple=True per-batch, false/1 - disable
     heartbeat: false
     reconnect_delays: [1, 2, 2, 10] # int/float or list of these, last one is used for all subsequent attempts
   carbon:

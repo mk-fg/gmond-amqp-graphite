@@ -75,12 +75,35 @@ class AMQPHarvester(AMQPLink):
 
 	def schema_init(self):
 		super(AMQPHarvester, self).schema_init()
+
 		queue = self.queue.copy()
 		queue_name = queue.pop('name')
+		bindings = queue.pop('bind')
+		queue_delete = queue.pop('delete_first')
+
 		self.ch.queue_declare(queue=queue_name, **queue)
-		# TODO: configurable bindings
-		self.ch.queue_bind( queue=queue_name,
-			exchange=self.exchange.name, routing_key='#' )
+
+		if queue_delete:
+			self.log.debug('Deleting previously-declared queue, as instructed')
+			assert queue_delete is True or queue_delete == 'if-empty'
+			queue_delete = dict(if_empty=True) if queue_delete == 'if-empty' else dict()
+			try: ack = self.ch.queue_delete(queue=queue_name, **queue_delete)
+			except self.exceptions.AMQPChannelError as err:
+				if err.args[0] == 406:
+					self.log.fatal( 'Failed to delete queue (name:'
+						' {}): {}'.format(queue_name, err.args[1]) )
+					sys.exit()
+				else: raise
+			else:
+				if not queue_delete:
+					self.log.debug( 'Messages lost with the'
+						' deleted queue: {}'.format(ack.method.message_count) )
+				self.ch.queue_declare(queue=queue_name, **queue)
+
+		for key in ([bindings] if isinstance(bindings, types.StringTypes) else bindings):
+			self.log.debug('Adding binding with routing_key {!r}'.format(key))
+			self.ch.queue_bind( queue=queue_name,
+				exchange=self.exchange.name, routing_key=key )
 
 	def decode(self, buff, content_type):
 		if content_type == 'application/x-gmond-amqp-1': return loads(buff)
@@ -96,6 +119,7 @@ class AMQPHarvester(AMQPLink):
 		ch.basic_ack(method.delivery_tag, multiple=bool(self.ack_batch))
 
 	def harvest(self):
+		assert isinstance(self.exclusive, bool) or self.exclusive == 'per-host'
 		consumer_kwz = dict(exclusive=bool(self.exclusive))\
 			if self.exclusive != 'per-host' else dict(consumer_tag=self.queue.name + node_id())
 		while True:
@@ -125,6 +149,10 @@ def main():
 	parser.add_argument('-c', '--config', action='append', default=list(),
 		help='Additional configuration files to read. Can be specified'
 			' multiple times, values from later ones override values in the former.')
+	parser.add_argument('--delete-queue', nargs='?', default=False,
+		help='Delete queue before re-declaring it,'
+			' useful to change bindings. Accepts "if-empty" argument,'
+			' overrides net.amqp.queue.delete_first configuration parameter.')
 	parser.add_argument('-n', '--dry-run', action='store_true', help='Do not actually send data.')
 	parser.add_argument('--dump', action='store_true', help='Dump polled data to stdout.')
 	parser.add_argument('--debug', action='store_true', help='Verbose operation mode.')
@@ -137,6 +165,8 @@ def main():
 		logging.DEBUG if optz.debug else logging.WARNING )
 	logging.captureWarnings(cfg.logging.warnings)
 
+	cfg.net.amqp.queue.delete_first = optz.delete_queue\
+		if optz.delete_queue is not None else True
 	optz.dump = optz.dump or cfg.debug.dump_data
 	optz.dry_run = optz.dry_run or cfg.debug.dry_run
 	log_tracebacks = cfg.logging.tracebacks

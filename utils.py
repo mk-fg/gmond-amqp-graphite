@@ -1,7 +1,7 @@
 from pika.adapters import BlockingConnection
 from pika.credentials import PlainCredentials
 from pika import BasicProperties, ConnectionParameters
-import pika.log
+import pika.log, pika.exceptions
 
 import itertools as it, operator as op, functools as ft
 from collections import Mapping
@@ -72,6 +72,7 @@ def node_id():
 
 class AMQPLink(object):
 
+	exceptions = pika.exceptions
 	class PikaError(Exception): pass
 
 	link = None
